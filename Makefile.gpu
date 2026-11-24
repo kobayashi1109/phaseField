@@ -1,0 +1,43 @@
+# GPU build helper for the PRISMS-PF development snapshot.
+# The original CMake files remain the authoritative build configuration.
+.DEFAULT_GOAL := all
+SHELL := /bin/bash
+ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+BUILD_DIR ?= $(ROOT)/build/gpu
+BUILD_DIR := $(abspath $(BUILD_DIR))
+CMAKE ?= cmake
+JOBS ?= 4
+KOKKOS_ROOT ?=
+MPI_ROOT ?=
+DEAL_II_DIR ?=
+CXX_WRAPPER ?= $(KOKKOS_ROOT)/bin/nvcc_wrapper
+MPI_CXX ?= $(MPI_ROOT)/bin/mpicxx
+CMAKE_PREFIX_PATH ?= $(KOKKOS_ROOT);$(MPI_ROOT)
+CORE_EXTRA_ARGS ?=
+APP_EXTRA_ARGS ?=
+COMMON = -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_CXX_COMPILER="$(CXX_WRAPPER)" \
+         -DMPI_CXX_COMPILER="$(MPI_CXX)" \
+         -Ddeal.II_DIR="$(DEAL_II_DIR)" \
+         -DCMAKE_PREFIX_PATH="$(CMAKE_PREFIX_PATH)"
+
+.PHONY: all check-env core laplace allen-cahn
+all: laplace allen-cahn
+
+check-env:
+	@test -x "$(CXX_WRAPPER)" || { echo 'Set KOKKOS_ROOT or CXX_WRAPPER to a CUDA-enabled Kokkos nvcc_wrapper.'; exit 1; }
+	@test -x "$(MPI_CXX)" || { echo 'Set MPI_ROOT or MPI_CXX to the MPI compiler used to build deal.II.'; exit 1; }
+	@test -d "$(DEAL_II_DIR)" || { echo 'Set DEAL_II_DIR to the directory containing the deal.II CMake package.'; exit 1; }
+	@"$(CMAKE)" --version
+
+core: check-env
+	"$(CMAKE)" -S "$(ROOT)" -B "$(BUILD_DIR)/core" $(COMMON) -DPRISMS_PF_GPU=ON -DPRISMS_PF_EXAMPLES=OFF $(CORE_EXTRA_ARGS)
+	"$(CMAKE)" --build "$(BUILD_DIR)/core" --parallel "$(JOBS)"
+
+laplace: core
+	"$(CMAKE)" -S "$(ROOT)/applications/laplace" -B "$(BUILD_DIR)/laplace" $(COMMON) -DPRISMS-PF_DIR="$(BUILD_DIR)/core/cmake" $(APP_EXTRA_ARGS)
+	"$(CMAKE)" --build "$(BUILD_DIR)/laplace" --parallel "$(JOBS)"
+
+allen-cahn: core
+	"$(CMAKE)" -S "$(ROOT)/applications/allen_cahn/explicit" -B "$(BUILD_DIR)/allen-cahn" $(COMMON) -DPRISMS-PF_DIR="$(BUILD_DIR)/core/cmake" $(APP_EXTRA_ARGS)
+	"$(CMAKE)" --build "$(BUILD_DIR)/allen-cahn" --parallel "$(JOBS)"

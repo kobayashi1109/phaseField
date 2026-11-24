@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: © 2026 PRISMS Center at the University of Michigan
 // SPDX-License-Identifier: GNU Lesser General Public Version 2.1
 
+#pragma once
+
 #include <prismspf/core/pde_operator_base.h>
+
+#ifdef PRISMS_PF_GPU
+#  include <prismspf/solvers/portable_scalar_pde_operator.h>
+#endif
 
 #include <random>
 
@@ -19,6 +25,57 @@ public:
   using VectorHess  = dealii::Tensor<3, dim, ScalarValue>;
   using PDEOperatorBase<dim, degree, number>::get_user_inputs;
   using PDEOperatorBase<dim, degree, number>::get_pf_tools;
+
+#ifdef PRISMS_PF_GPU
+  /**
+   * @brief Compile-time GPU counterpart of compute_lhs() for Laplace solve block 1.
+   *
+   * No host-side FieldContainer or virtual PDE callback is used on the GPU.
+   * This is a scalar, single-field example, not general multi-field support.
+   */
+  struct GpuLHS
+  {
+    static constexpr dealii::EvaluationFlags::EvaluationFlags evaluation_flags =
+      dealii::EvaluationFlags::gradients;
+    static constexpr dealii::EvaluationFlags::EvaluationFlags integration_flags =
+      dealii::EvaluationFlags::gradients;
+
+    template <typename ScalarField>
+    DEAL_II_HOST_DEVICE void
+    operator()(const ScalarField &field) const
+    {
+      field.set_gradient_term(field.get_gradient());
+    }
+  };
+
+  using DeviceVector = typename PDEOperatorBase<dim, degree, number>::DeviceVector;
+
+  bool
+  supports_gpu_lhs(const unsigned int solve_block_id) const override
+  {
+    return solve_block_id == 1;
+  }
+
+  bool
+  compute_gpu_lhs(const unsigned int solve_block_id,
+                  const unsigned int field_index,
+                  const MatrixFreeManager<dim, number> &manager,
+                  DeviceVector &dst,
+                  const DeviceVector &src) const override
+  {
+    if (solve_block_id != 1 || field_index != 0)
+      return false;
+
+    PortableScalarPDEOperator<dim, degree, number, GpuLHS> op(manager, field_index);
+    // Match CPU MFOperator::compute_operator(): cell_loop alone does not
+    // copy constrained src values into dst. This avoids adding identity
+    // rows during the CPU-CG -> GPU-matvec bridge.
+    dst = number(0);
+    op.apply_cells(dst, src);
+    return true;
+  }
+
+#endif
 
   /**
    * @brief Constructor.

@@ -14,6 +14,13 @@
 #include <prismspf/core/types.h>
 
 #include <prismspf/solvers/mf_operator.h>
+#ifdef PRISMS_PF_GPU
+#  include <prismspf/solvers/portable_native_cg.h>
+#include <prismspf/solvers/portable_native_pcg.h>
+#  include <cstdlib>
+#  include <cstring>
+#  include <iostream>
+#endif
 #include <prismspf/solvers/solver_base.h>
 
 #include <prismspf/user_inputs/solve_parameters.h>
@@ -349,6 +356,83 @@ public:
     solutions.update_ghosts();
   }
 
+#ifdef PRISMS_PF_GPU
+  // Experimental D-stage GPU-resident CG. Only explicitly supported problems
+  // are admitted; do not silently switch to CPU when this mode is requested.
+  bool
+  try_gpu_native_cg(
+    BlockVector<number> &b_vector,
+    BlockVector<number> &x_vector,
+    const BlockVector<number> *inverse_diagonal = nullptr)
+  {
+    const char *env = std::getenv("PRISMS_PF_D_GPU_CG");
+    if (env == nullptr || std::strcmp(env, "1") != 0)
+      return false;
+
+    AssertThrow(lin_params().solver_type == "cg" &&
+                  lin_params().preconditioner == None &&
+                  lin_params().tolerance_type == AbsoluteResidual &&
+                  solve_block.field_indices.size() == 1 &&
+                  b_vector.n_blocks() == 1 && x_vector.n_blocks() == 1 &&
+                  !solve_context->get_user_inputs().spatial_discretization.has_adaptivity,
+                dealii::ExcMessage(
+                  "D GPU-native CG Stage 1 requires cg, preconditioner=None, "
+                  "tolerance type=AbsoluteResidual, one scalar field/block, "
+                  "and no adaptive mesh refinement."));
+
+    const unsigned int field_index = *solve_block.field_indices.begin();
+    const auto &pde = solve_context->get_pde_operator();
+    AssertThrow(pde.supports_gpu_lhs(solve_block.id),
+                dealii::ExcMessage("D GPU-native CG: PDE has no GPU LHS implementation"));
+
+    const auto &manager = solve_context->get_matrix_free_manager();
+    const auto &mf = manager.get_portable_shared_matrix_free(field_index);
+    const auto partitioner = mf.get_vector_partitioner();
+    AssertThrow(partitioner != nullptr &&
+                  partitioner->n_mpi_processes() == 1 &&
+                  partitioner->n_ghost_indices() == 0 &&
+                  partitioner->n_import_indices() == 0,
+                dealii::ExcMessage(
+                  "D GPU-native CG: requires one MPI rank, zero ghost/import DoFs"));
+
+    std::cout << "[GPU Native CG] D-stage single-rank GPU "
+              << (inverse_diagonal != nullptr
+                    ? "CG with Jacobi"
+                    : "CG without preconditioner")
+              << std::endl;
+
+    bool converged;
+
+    if (inverse_diagonal != nullptr)
+    {
+        Timer::Scope scope("D2 GPU PCG");
+    
+        converged =
+            ExperimentalGPU::native_pcg_solve<dim, degree, number>(
+                pde, manager, solve_block.id, field_index,
+                x_vector, b_vector, *inverse_diagonal,
+                linear_solver_control);
+    }
+    else
+    {
+        converged =
+            ExperimentalGPU::native_cg_solve<dim, degree, number>(
+                pde, manager, solve_block.id, field_index,
+                x_vector, b_vector, linear_solver_control);
+    }
+
+    std::cout << "[GPU Native CG] iterations: "
+              << linear_solver_control.last_step()
+              << " residual: " << linear_solver_control.last_value()
+              << " converged: " << (converged ? 1 : 0) << std::endl;
+
+    if (!converged)
+      throw dealii::SolverControl::NoConvergence(
+        linear_solver_control.last_step(), linear_solver_control.last_value());
+    return true;
+  }
+#endif  // PRISMS_PF_D_GPU_CG
+
   int
   do_linear_solve(BlockVector<number>             &b_vector,
                   MFOperator<dim, degree, number> &lhs_matrix,
@@ -357,13 +441,74 @@ public:
     // Linear solve
     try
       {
+#ifdef PRISMS_PF_GPU
+        const char *native_cg_flag = std::getenv("PRISMS_PF_D_GPU_CG");
+        if (native_cg_flag != nullptr && std::strcmp(native_cg_flag, "1") == 0)
+          AssertThrow(lin_params().preconditioner == None,
+                      dealii::ExcMessage(
+                        "D GPU-native CG requires preconditioner=None"));
+#endif
         if (lin_params().preconditioner == None)
-          {
-            lin_solver.solve(lhs_matrix,
-                             x_vector,
-                             b_vector,
-                             dealii::PreconditionIdentity());
-          }
+        {
+        #ifdef PRISMS_PF_GPU
+            const char *jacobi_env =
+                std::getenv("PRISMS_PF_D_JACOBI");
+        
+            const bool use_jacobi =
+                jacobi_env != nullptr &&
+                std::strcmp(jacobi_env, "1") == 0;
+        
+            if (use_jacobi)
+            {
+                AssertThrow(
+                    lin_params().solver_type == "cg" &&
+                    lin_params().tolerance_type == AbsoluteResidual &&
+                    solve_block.field_indices.size() == 1 &&
+                    b_vector.n_blocks() == 1 &&
+                    x_vector.n_blocks() == 1 &&
+                    !solve_context->get_user_inputs()
+                         .spatial_discretization.has_adaptivity,
+                    dealii::ExcMessage(
+                        "D2 Jacobi requires CG, AbsoluteResidual, "
+                        "one scalar block and no AMR"));
+                    
+                {
+                    Timer::Scope scope("D2 Jacobi Setup");
+                
+                    lhs_matrix.reinit_matrix_diagonal();
+                    lhs_matrix.eval_matrix_diagonal();
+                }
+              
+                const auto &inverse_diagonal =
+                    lhs_matrix.get_matrix_diagonal_inverse();
+              
+                if (!try_gpu_native_cg(
+                        b_vector,
+                        x_vector,
+                        &inverse_diagonal->get_vector()))
+                {
+                    Timer::Scope scope("D2 CPU PCG");
+                
+                    std::cout << "[CPU PCG] Jacobi active"
+                              << std::endl;
+                
+                    lin_solver.solve(
+                        lhs_matrix,
+                        x_vector,
+                        b_vector,
+                        *inverse_diagonal);
+                }
+            }
+            else if (!try_gpu_native_cg(b_vector, x_vector))
+        #endif
+            {
+                lin_solver.solve(
+                    lhs_matrix,
+                    x_vector,
+                    b_vector,
+                    dealii::PreconditionIdentity());
+            }
+        }
         else if (lin_params().preconditioner == Chebyshev)
           {
             lhs_matrix.reinit_matrix_diagonal();

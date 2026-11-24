@@ -3,6 +3,10 @@
 
 #include <prismspf/core/pde_operator_base.h>
 
+#ifdef PRISMS_PF_GPU
+#  include <prismspf/solvers/portable_scalar_pde_operator.h>
+#endif
+
 PRISMS_PF_BEGIN_NAMESPACE
 
 template <unsigned int dim, unsigned int degree, typename number>
@@ -99,6 +103,92 @@ private:
         variable_list.set_value_term(2, f_tot);
       }
   }
+
+#ifdef PRISMS_PF_GPU
+  using DeviceVector =
+    typename PDEOperatorBase<dim, degree, number>::DeviceVector;
+
+public:
+  // Public for CUDA/Kokkos-generated kernel registration code.
+  // Device-callable version of the CPU RHS for the primary explicit field.
+  // The input represents old_1(n). Inverse mass scaling is done by the solver.
+  struct GpuRHS
+  {
+    number dt;
+    number mobility;
+    number gradient_energy;
+
+    // deal.II 9.6's EvaluationFlags::operator| is not constexpr.
+    // Combine the enum bits using the built-in integral operator instead.
+    static constexpr auto evaluation_flags =
+      static_cast<decltype(dealii::EvaluationFlags::values)>(
+        static_cast<unsigned int>(dealii::EvaluationFlags::values) |
+        static_cast<unsigned int>(dealii::EvaluationFlags::gradients));
+
+    static constexpr auto integration_flags = evaluation_flags;
+
+    DEAL_II_HOST_DEVICE void
+    operator()(PortableScalarField<dim, degree, number> &field) const
+    {
+      const number n_val = field.get_value();
+      const auto n_grad = field.get_gradient();
+
+      const number f_well =
+        number(4.0) * n_val * (n_val - number(1.0)) *
+        (n_val - number(0.5));
+
+      const number eq_n = n_val - dt * mobility * f_well;
+      const auto eqx_n = -dt * gradient_energy * mobility * n_grad;
+
+      field.set_value_term(eq_n);
+      field.set_gradient_term(eqx_n);
+    }
+  };
+
+private:
+  bool
+  supports_gpu_rhs(unsigned int solve_block_id) const override
+  {
+    return solve_block_id == 1;
+  }
+
+  // This example has one self-dependent primary scalar and read-only
+  // postprocessing of its Current value. It has no pre/post solve hooks.
+  bool
+  supports_gpu_resident_explicit(unsigned int solve_block_id) const override
+  {
+    return solve_block_id == 1;
+  }
+
+  bool
+  compute_gpu_rhs(
+    unsigned int solve_block_id,
+    unsigned int field_index,
+    const MatrixFreeManager<dim, number> &manager,
+    const SimulationTimer &sim_timer,
+    DeviceVector &dst,
+    const DeviceVector &src) const override
+  {
+    if (solve_block_id != 1 || field_index != 0)
+      return false;
+
+    PortableScalarPDEOperator<dim, degree, number, GpuRHS>
+      gpu_operator(manager, field_index);
+
+    const GpuRHS pde{
+      static_cast<number>(sim_timer.get_timestep()),
+      m_well,
+      kappa
+    };
+
+    // Assemble only the RHS. Unlike vmult(), apply_cells() does not impose
+    // the LHS identity-row treatment for constrained DoFs.
+    dst = number(0);
+    gpu_operator.apply_cells(dst, src, pde);
+
+    return true;
+  }
+#endif
 
   number m_well;
   number kappa;

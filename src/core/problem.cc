@@ -430,6 +430,71 @@ Problem<dim, degree, number>::solve_increment(SimulationTimer &sim_timer)
     user_inputs.grain_reassignment_parameters.should_perform_grain_reassignment(
       increment);
 
+#ifdef PRISMS_PF_GPU
+  // E1 experimental resident path. Restrict this to an explicitly opted-in,
+  // self-dependent primary scalar block, followed only by CPU postprocessing.
+  // No AMR, nucleation, grain remapping, or coupled primary solves yet.
+  ExplicitSolver<dim, degree, number> *resident_solver = nullptr;
+  if (ExperimentalGPU::explicit_mode() == 2)
+    {
+      // The nucleation scheduler returns true at increment zero even when
+      // no field is a nucleation-rate variable. Check whether nucleation is
+      // actually configured (the same flag used by NucleationManager), not
+      // whether this increment happens to match the scheduler.
+      AssertThrow(!user_inputs.spatial_discretization.has_adaptivity &&
+                    !has_multigrid(solve_blocks) &&
+                    dealii::Utilities::MPI::n_mpi_processes(MPI_COMM_WORLD) == 1,
+                  dealii::ExcMessage("E1 resident mode requires one MPI rank, "
+                                     "no AMR or multigrid"));
+      const bool has_nucleation_rate_field =
+        std::any_of(field_attributes.begin(),
+                    field_attributes.end(),
+                    [](const FieldAttributes &field)
+                    {
+                      return field.is_nucleation_rate_variable;
+                    });
+      AssertThrow(!has_nucleation_rate_field,
+                  dealii::ExcMessage("E1 resident mode does not support nucleation-rate fields"));
+      AssertThrow(!user_inputs.grain_reassignment_parameters.grain_reassignment_active,
+                  dealii::ExcMessage("E1 resident mode does not support grain reassignment"));
+      for (const auto &solver : solvers)
+        {
+          const auto &block = solver->get_solve_block();
+          if (block.solve_timing == SolveTiming::Primary)
+            {
+              AssertThrow(resident_solver == nullptr &&
+                            block.solve_type == SolveType::Explicit &&
+                            block.field_indices.size() == 1 &&
+                            solve_context.get_pde_operator().supports_gpu_rhs(block.id) &&
+                            solve_context.get_pde_operator()
+                              .supports_gpu_resident_explicit(block.id),
+                          dealii::ExcMessage("E1 resident mode requires exactly one "
+                                             "opted-in primary explicit block"));
+              resident_solver =
+                dynamic_cast<ExplicitSolver<dim, degree, number> *>(solver.get());
+              AssertThrow(resident_solver != nullptr,
+                          dealii::ExcMessage("E1 resident solver type mismatch"));
+              const unsigned int field_index = *block.field_indices.begin();
+              AssertThrow(field_attributes[field_index].field_type == TensorRank::Scalar &&
+                            solve_context.get_matrix_free_manager()
+                              .get_shared_matrix_free().get_affine_constraints(field_index)
+                              .n_constraints() == 0,
+                          dealii::ExcMessage("E1 resident mode requires an unconstrained scalar"));
+            }
+          else
+            {
+              AssertThrow(resident_solver != nullptr &&
+                            block.solve_timing == SolveTiming::PostProcess &&
+                            block.solve_type == SolveType::Explicit,
+                          dealii::ExcMessage("E1 resident mode supports only CPU explicit "
+                                             "postprocessing after the primary block"));
+            }
+        }
+      AssertThrow(resident_solver != nullptr,
+                  dealii::ExcMessage("E1 resident mode: no opted-in primary solver"));
+    }
+#endif
+
   // Update the time-dependent constraints
   // TODO: Loop over levels, pass in current time
   constraint_manager.update_time_dependent_constraints(field_attributes);
@@ -449,6 +514,13 @@ Problem<dim, degree, number>::solve_increment(SimulationTimer &sim_timer)
         solve_context.get_pde_operator().pre_solve_block(solve_context,
                                                          solver->get_solve_block().id);
         solver->solve();
+#ifdef PRISMS_PF_GPU
+        // The CPU postprocess block reads Current before VTU output, so the
+        // resident field must be materialized immediately after the primary
+        // solve, not only just before SolutionOutput.
+        if (resident_solver == solver.get() && is_output_increment)
+          resident_solver->sync_resident_current_to_host();
+#endif
         solver->update_ghosts();
         solve_context.get_pde_operator().post_solve_block(solve_context,
                                                           solver->get_solve_block().id);
@@ -461,10 +533,21 @@ Problem<dim, degree, number>::solve_increment(SimulationTimer &sim_timer)
        field_index < solve_context.get_field_attributes().size();
        ++field_index)
     {
-      const auto &vec =
-        solve_context.get_solution_indexer().get_solution_vector(field_index);
-      bool not_finite =
-        vec.locally_owned_size() > 0 && !dealii::numbers::is_finite(vec.local_element(0));
+      bool not_finite = false;
+#ifdef PRISMS_PF_GPU
+      if (resident_solver && resident_solver->has_resident_solution() &&
+          resident_solver->get_solve_block().field_indices.count(field_index) != 0)
+        {
+          not_finite = resident_solver->resident_sample_not_finite();
+        }
+      else
+#endif
+        {
+          const auto &vec =
+            solve_context.get_solution_indexer().get_solution_vector(field_index);
+          not_finite = vec.locally_owned_size() > 0 &&
+                       !dealii::numbers::is_finite(vec.local_element(0));
+        }
       if (dealii::Utilities::MPI::logical_or(not_finite, MPI_COMM_WORLD))
         {
           exit_status  = 2;
@@ -510,6 +593,19 @@ Problem<dim, degree, number>::solve_increment(SimulationTimer &sim_timer)
       // Perform grid refinement
       grid_refiner.do_adaptive_refinement(solvers);
     }
+
+#ifdef PRISMS_PF_GPU
+  if (resident_solver)
+    {
+      const bool final_increment =
+        increment == user_inputs.temporal_discretization.n_increments || exit_status != 0;
+      if (is_output_increment || force_output || final_increment)
+        resident_solver->sync_resident_current_to_host();
+      // Restore both host history slots before the final CPU update() swap.
+      if (final_increment)
+        resident_solver->sync_resident_previous_to_host();
+    }
+#endif
 
   // Output results if needed
   if (is_output_increment || force_output)

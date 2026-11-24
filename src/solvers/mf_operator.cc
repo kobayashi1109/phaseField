@@ -12,6 +12,20 @@
 
 #include <prismspf/utilities/assert.h>
 
+
+#ifdef PRISMS_PF_GPU
+#  include <deal.II/matrix_free/portable_matrix_free.h>
+#  include <deal.II/matrix_free/portable_matrix_free.templates.h>
+#  include <deal.II/base/mpi.h>
+#  include <deal.II/lac/la_parallel_vector.h>
+#  include <Kokkos_Core.hpp>
+#  include <algorithm>
+#  include <cmath>
+#  include <cstdlib>
+#  include <cstring>
+#  include <iostream>
+#endif
+
 PRISMS_PF_BEGIN_NAMESPACE
 
 template <unsigned int dim, unsigned int degree, typename number>
@@ -21,7 +35,112 @@ MFOperator<dim, degree, number>::compute_operator(BlockVector<number>       &dst
 {
   Timer::Scope scope("Compute Operator");
 
-  data->cell_loop(&MFOperator::compute_local_operator, this, dst, src, true);
+  bool used_gpu = false;
+#ifdef PRISMS_PF_GPU
+  const char *gpu_env = std::getenv("PRISMS_PF_C_GPU_VMULT");
+  const bool gpu_requested = gpu_env != nullptr && std::strcmp(gpu_env, "1") == 0;
+  using PDEBase = PDEOperatorBase<dim, degree, number>;
+  if (gpu_requested && !read_plain && pde_op == &PDEBase::compute_lhs &&
+      solve_block.field_indices.size() == 1 && src.n_blocks() == 1 &&
+      dst.n_blocks() == 1 && pde_operator != nullptr &&
+      pde_operator->supports_gpu_lhs(solve_block.id))
+    {
+      const unsigned int field_index = *solve_block.field_indices.begin();
+      const auto &portable_mf =
+        matrix_free_manager->get_portable_shared_matrix_free(field_index);
+      const auto partitioner = portable_mf.get_vector_partitioner();
+      AssertThrow(partitioner != nullptr && partitioner->n_mpi_processes() == 1 &&
+                    partitioner->n_ghost_indices() == 0 &&
+                    partitioner->n_import_indices() == 0,
+                  dealii::ExcMessage("C GPU vmult supports only one MPI rank with zero ghosts/imports"));
+
+      using DeviceVector = typename PDEBase::DeviceVector;
+      DeviceVector device_src, device_dst;
+      portable_mf.initialize_dof_vector(device_src);
+      portable_mf.initialize_dof_vector(device_dst);
+      const unsigned int n = device_src.locally_owned_size();
+      AssertThrow(src.block(0).locally_owned_size() == n &&
+                    dst.block(0).locally_owned_size() == n,
+                  dealii::ExcMessage("Host/device owned DoF counts differ"));
+
+      using Unmanaged = Kokkos::MemoryTraits<Kokkos::Unmanaged>;
+      using DeviceMemory = dealii::MemorySpace::Default::kokkos_space;
+      using HostRead = Kokkos::View<const number *, Kokkos::HostSpace, Unmanaged>;
+      using HostWrite = Kokkos::View<number *, Kokkos::HostSpace, Unmanaged>;
+      using DeviceRead = Kokkos::View<const number *, DeviceMemory, Unmanaged>;
+      using DeviceWrite = Kokkos::View<number *, DeviceMemory, Unmanaged>;
+
+      Kokkos::deep_copy(DeviceWrite(device_src.get_values(), n),
+                        HostRead(src.block(0).get_values(), n));
+
+      // C4_GPU_DIRICHLET_INPUT_ZERO_20261117
+      // CPU FEEvaluation::read_dof_values() applies homogeneous constraints.
+      // Portable::FEEvaluation gathers raw constrained entries. The standalone
+      // Laplace probe explicitly zeroed them; the CG solver generally does not.
+      // This C-stage path handles single-rank homogeneous constraints only.
+      portable_mf.set_constrained_values(number(0), device_src);
+      Kokkos::fence(); // Finish masking before entering the custom GPU operator.
+
+      // Diagnostic: whether the CPU solver supplied nonzero constrained DoFs.
+      static bool printed_constrained_input = false;
+      if (!printed_constrained_input)
+        {
+          number constrained_source_sq = number(0);
+          for (const auto i : data->get_constrained_dofs(field_index))
+            if (i < n)
+              {
+                const number v = src.block(0).local_element(i);
+                constrained_source_sq += v * v;
+              }
+          std::cout << "[GPU MFOperator] constrained src L2 norm before masking: "
+                    << std::sqrt(constrained_source_sq) << std::endl;
+          printed_constrained_input = true;
+        }
+
+      used_gpu = pde_operator->compute_gpu_lhs(
+        solve_block.id, field_index, *matrix_free_manager, device_dst, device_src);
+      if (used_gpu)
+        {
+          Kokkos::fence(); // Ensure cell accumulation is complete.
+          // Match CPU integrate_scatter: constrained rows must be zero.
+          portable_mf.set_constrained_values(number(0), device_dst);
+          Kokkos::fence();
+          Kokkos::deep_copy(HostWrite(dst.block(0).get_values(), n),
+                            DeviceRead(device_dst.get_values(), n));
+
+          static bool printed = false;
+          if (!printed)
+            {
+              std::cout << "[GPU MFOperator] C-stage host/device adapter active "
+                           "(CPU CG, GPU LHS matvec)" << std::endl;
+              printed = true;
+            }
+
+          const char *verify = std::getenv("PRISMS_PF_C_GPU_VERIFY");
+          static bool checked = false;
+          if (!checked && verify != nullptr && std::strcmp(verify, "1") == 0)
+            {
+              BlockVector<number> cpu_reference;
+              cpu_reference.reinit(dst);
+              data->cell_loop(&MFOperator::compute_local_operator,
+                              this, cpu_reference, src, true);
+              BlockVector<number> difference;
+              difference.reinit(dst);
+              difference = dst;
+              difference -= cpu_reference;
+              const number relative_error = difference.l2_norm() /
+                std::max(cpu_reference.l2_norm(), number(1.0e-30));
+              std::cout << "[GPU MFOperator] CPU/GPU vmult relative L2 error: "
+                        << relative_error << std::endl;
+              AssertThrow(relative_error < number(1.0e-12),
+                          dealii::ExcMessage("GPU MFOperator vmult differs from CPU"));
+              checked = true;
+            }
+        }
+    }
+#endif  // PRISMS_PF_C_GPU_VMULT
+  if (!used_gpu)
+    data->cell_loop(&MFOperator::compute_local_operator, this, dst, src, true);
   if (scale_by_diagonal)
     {
       for (unsigned int block_index = 0; block_index < dst.n_blocks(); block_index++)

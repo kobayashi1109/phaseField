@@ -68,6 +68,14 @@ public:
   [[nodiscard]] const MatrixFree<dim, number> &
   get_shared_matrix_free() const;
 
+#ifdef PRISMS_PF_GPU
+  /**
+   * @brief Get the Portable MatrixFree object for a field.
+   */
+  [[nodiscard]] const dealii::Portable::MatrixFree<dim, number> &
+  get_portable_shared_matrix_free(unsigned int field_index) const;
+#endif
+
   [[nodiscard]] const MatrixFree<dim, number> &
   get_generic_matrix_free() const;
 
@@ -245,6 +253,16 @@ MatrixFreeManager<dim, number>::get_shared_matrix_free() const
 {
   return shared_matrix_free;
 }
+
+#ifdef PRISMS_PF_GPU
+template <unsigned int dim, typename number>
+const dealii::Portable::MatrixFree<dim, number> &
+MatrixFreeManager<dim, number>::get_portable_shared_matrix_free(
+  unsigned int field_index) const
+{
+  return portable_shared_matrix_free.at(field_index);
+}
+#endif
 
 template <unsigned int dim, typename number>
 const MatrixFree<dim, number> &

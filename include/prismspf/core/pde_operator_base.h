@@ -12,7 +12,16 @@
 
 #include <prismspf/config.h>
 
+#ifdef PRISMS_PF_GPU
+#  include <deal.II/lac/la_parallel_vector.h>
+#endif
+
 PRISMS_PF_BEGIN_NAMESPACE
+
+#ifdef PRISMS_PF_GPU
+template <unsigned int dim, typename number>
+class MatrixFreeManager;
+#endif
 
 template <unsigned int dim, unsigned int degree, typename number>
 class SolveContext;
@@ -39,6 +48,67 @@ public:
    * @brief Destructor.
    */
   virtual ~PDEOperatorBase() = default;
+
+
+#ifdef PRISMS_PF_GPU
+  // C-stage experimental bridge: the host virtual method dispatches to a
+  // device-callable operator implemented by the derived application PDE.
+  // The virtual call itself ALWAYS happens on the CPU, never in a GPU kernel.
+  using DeviceVector = dealii::LinearAlgebra::distributed::Vector<
+    number, dealii::MemorySpace::Default>;
+
+  virtual bool
+  supports_gpu_lhs([[maybe_unused]] unsigned int solve_block_id) const
+  {
+    return false;
+  }
+
+  virtual bool
+  compute_gpu_lhs(
+    [[maybe_unused]] unsigned int solve_block_id,
+    [[maybe_unused]] unsigned int field_index,
+    [[maybe_unused]] const MatrixFreeManager<dim, number> &manager,
+    [[maybe_unused]] DeviceVector &dst,
+    [[maybe_unused]] const DeviceVector &src) const
+  {
+    return false;
+  }
+
+  // E1-stage experimental RHS bridge. Like the LHS bridge, dispatch occurs
+  // on the host. The source vector supplies the PDE's input field (OldOne
+  // for the explicit Allen-Cahn example). The result is the assembled RHS
+  // before inverse mass scaling and application of solution constraints.
+  virtual bool
+  supports_gpu_rhs([[maybe_unused]] unsigned int solve_block_id) const
+  {
+    return false;
+  }
+
+  // E1 resident execution is a separate opt-in from GPU RHS support.
+  // The application promises that its primary explicit block depends only
+  // on its own OldOne scalar field. CPU postprocess blocks may read Current
+  // at output increments but may not change the primary field or read its
+  // history. User pre/post solve hooks must not access/modify the resident
+  // solution between synchronization points. See Problem::solve_increment.
+  virtual bool
+  supports_gpu_resident_explicit(
+    [[maybe_unused]] unsigned int solve_block_id) const
+  {
+    return false;
+  }
+
+  virtual bool
+  compute_gpu_rhs(
+    [[maybe_unused]] unsigned int solve_block_id,
+    [[maybe_unused]] unsigned int field_index,
+    [[maybe_unused]] const MatrixFreeManager<dim, number> &manager,
+    [[maybe_unused]] const SimulationTimer &sim_timer,
+    [[maybe_unused]] DeviceVector &dst,
+    [[maybe_unused]] const DeviceVector &src) const
+  {
+    return false;
+  }
+#endif  // PRISMS_PF_GPU
 
   /**
    * @brief User-implemented class for the setting initial conditions.
